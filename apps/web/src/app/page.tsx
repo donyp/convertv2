@@ -57,6 +57,9 @@ export default function Home() {
         } catch {
           if (text && text.length < 200) message = text;
         }
+        if (res.status === 404) {
+          message += " | Pastikan NEXT_PUBLIC_API_URL mengarah ke backend yang valid.";
+        }
         throw new Error(message);
       }
       const blob = await res.blob();
