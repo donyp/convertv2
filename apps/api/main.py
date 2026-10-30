@@ -285,6 +285,51 @@ def delete_job(job_id: str):
     return {"deleted": True}
 
 
+@app.post("/api/v1/convert")
+async def convert_direct(
+    file: UploadFile = File(...),
+    password: Optional[str] = Form(None),
+):
+    import base64
+    import tempfile
+
+    from fastapi.responses import Response
+
+    job_dir = STORAGE_DIR / str(uuid.uuid4())
+    job_dir.mkdir(parents=True, exist_ok=True)
+    file_path = job_dir / (file.filename or "upload.pdf")
+    with file_path.open("wb") as f:
+        shutil.copyfileobj(file.file, f)
+
+    try:
+        bank = detect_bank(str(file_path), password=password)
+        result = PARSERS[bank](str(file_path), password=password)
+        result = validate_parse_result(result)
+        xlsx_path = file_path.with_suffix(".xlsx")
+        export_to_excel(result, str(xlsx_path))
+        with xlsx_path.open("rb") as f:
+            data = f.read()
+        # cleanup
+        try:
+            file_path.unlink(missing_ok=True)
+            xlsx_path.unlink(missing_ok=True)
+            job_dir.rmdir()
+        except Exception:
+            pass
+        filename = f"{bank}_{file.filename or 'mutation'}.xlsx"
+        return Response(
+            content=data,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+    except Exception as exc:
+        try:
+            shutil.rmtree(job_dir, ignore_errors=True)
+        except Exception:
+            pass
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
 @app.get("/health")
 def health():
     return {"status": "ok", "supabase": bool(supabase)}
