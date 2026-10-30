@@ -105,7 +105,7 @@ def _create_job(job_id: str, filename: str):
         "validation_status": None,
         "transaction_count": None,
         "result_json": None,
-        "xlsx_path": None,
+        "xlsx_bytes": None,
         "created_at": datetime.utcnow().isoformat(),
         "completed_at": None,
     }
@@ -141,10 +141,6 @@ def _delete_job(job_id: str) -> bool:
         return False
     if supabase:
         supabase.table("jobs").delete().eq("id", job_id).execute()
-        try:
-            supabase.storage.from_(SUPABASE_BUCKET).remove([f"{job_id}/input.pdf", f"{job_id}/output.xlsx"])
-        except Exception:
-            pass
     else:
         with jobs_lock:
             jobs.pop(job_id, None)
@@ -186,35 +182,34 @@ def process_job(job_id: str, file_path: Path, password: Optional[str]):
         _update_job(job_id, progress=80, message="Exporting Excel")
         export_to_excel(result, str(xlsx_local))
 
+        # Read bytes into memory, then remove all temp files (no persistent storage).
+        with xlsx_local.open("rb") as f:
+            xlsx_bytes = f.read()
+        import base64
+
+        xlsx_b64 = base64.b64encode(xlsx_bytes).decode("ascii")
+
+        # Clean temp files.
+        try:
+            file_path.unlink(missing_ok=True)
+            xlsx_local.unlink(missing_ok=True)
+            file_path.parent.rmdir()
+        except Exception:
+            pass
+
         result_json = _serialize_result(result)
-        if supabase:
-            input_remote = _upload_storage(job_id, file_path, "input.pdf")
-            xlsx_remote = _upload_storage(job_id, xlsx_local, "output.xlsx")
-            _update_job(
-                job_id,
-                status="completed",
-                progress=100,
-                message="Completed",
-                bank=bank,
-                validation_status=result.validation_status,
-                transaction_count=len(result.transactions),
-                result_json=result_json,
-                xlsx_path=xlsx_remote,
-                completed_at=datetime.utcnow().isoformat(),
-            )
-        else:
-            _update_job(
-                job_id,
-                status="completed",
-                progress=100,
-                message="Completed",
-                bank=bank,
-                validation_status=result.validation_status,
-                transaction_count=len(result.transactions),
-                result_json=result_json,
-                xlsx_path=str(xlsx_local),
-                completed_at=datetime.utcnow().isoformat(),
-            )
+        _update_job(
+            job_id,
+            status="completed",
+            progress=100,
+            message="Completed",
+            bank=bank,
+            validation_status=result.validation_status,
+            transaction_count=len(result.transactions),
+            result_json=result_json,
+            xlsx_bytes=xlsx_b64,
+            completed_at=datetime.utcnow().isoformat(),
+        )
     except Exception as exc:
         _update_job(job_id, status="failed", progress=100, message=str(exc))
 
@@ -267,14 +262,19 @@ def get_result(job_id: str):
 @app.get("/api/v1/jobs/{job_id}/download")
 def download(job_id: str):
     job = _get_job(job_id)
-    if not job or not job.get("xlsx_path"):
+    if not job or not job.get("xlsx_bytes"):
         raise HTTPException(status_code=404, detail="File not found")
-    if supabase:
-        url = _signed_url(job["xlsx_path"])
-        return RedirectResponse(url)
-    from fastapi.responses import FileResponse
+    import base64
 
-    return FileResponse(job["xlsx_path"], filename=f"{job.get('bank') or 'mutation'}_{job_id}.xlsx")
+    from fastapi.responses import Response
+
+    data = base64.b64decode(job["xlsx_bytes"])
+    filename = f"{job.get('bank') or 'mutation'}_{job_id}.xlsx"
+    return Response(
+        content=data,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @app.delete("/api/v1/jobs/{job_id}")

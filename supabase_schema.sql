@@ -8,7 +8,7 @@ create table if not exists public.jobs (
   validation_status text,
   transaction_count int,
   result_json jsonb,
-  xlsx_path text,
+  xlsx_bytes text,
   created_at timestamptz not null default now(),
   completed_at timestamptz
 );
