@@ -1,13 +1,14 @@
+import os
 import shutil
 import threading
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import RedirectResponse
 
 from converter.detector import detect_bank
 from converter.excel_exporter import export_to_excel
@@ -26,10 +27,24 @@ PARSERS = {
     "MUAMALAT": parse_muamalat_pdf,
 }
 
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+SUPABASE_BUCKET = os.getenv("SUPABASE_BUCKET", "mutation-files")
+
+supabase = None
+if SUPABASE_URL and SUPABASE_KEY:
+    try:
+        from supabase import create_client
+
+        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+    except Exception:
+        supabase = None
+
+# In-memory fallback for local development.
 jobs: Dict[str, dict] = {}
 jobs_lock = threading.Lock()
 
-app = FastAPI(title="Bank Mutation Converter API", version="0.1.0")
+app = FastAPI(title="Bank Mutation Converter API", version="0.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -40,93 +55,7 @@ app.add_middleware(
 )
 
 
-def _set_job(job_id: str, **kwargs):
-    with jobs_lock:
-        jobs[job_id].update(kwargs)
-
-
-def process_job(job_id: str, file_path: Path, password: Optional[str]):
-    try:
-        _set_job(job_id, status="processing", progress=10, message="Detecting bank")
-        bank = detect_bank(str(file_path), password=password)
-        _set_job(job_id, progress=25, message=f"Parsing {bank}")
-        result = PARSERS[bank](str(file_path), password=password)
-        _set_job(job_id, progress=60, message="Validating")
-        result = validate_parse_result(result)
-        xlsx_path = file_path.with_suffix(".xlsx")
-        _set_job(job_id, progress=80, message="Exporting Excel")
-        export_to_excel(result, str(xlsx_path))
-        _set_job(
-            job_id,
-            status="completed",
-            progress=100,
-            message="Completed",
-            bank=bank,
-            result=result,
-            xlsx_path=str(xlsx_path),
-            completed_at=datetime.utcnow().isoformat(),
-        )
-    except Exception as exc:
-        _set_job(job_id, status="failed", progress=100, message=str(exc))
-
-
-@app.post("/api/v1/jobs")
-async def create_job(
-    background_tasks: BackgroundTasks,
-    file: UploadFile = File(...),
-    password: Optional[str] = Form(None),
-):
-    job_id = str(uuid.uuid4())
-    job_dir = STORAGE_DIR / job_id
-    job_dir.mkdir(parents=True, exist_ok=True)
-    file_path = job_dir / file.filename
-    with file_path.open("wb") as f:
-        shutil.copyfileobj(file.file, f)
-
-    with jobs_lock:
-        jobs[job_id] = {
-            "id": job_id,
-            "status": "queued",
-            "progress": 0,
-            "message": "Queued",
-            "filename": file.filename,
-            "created_at": datetime.utcnow().isoformat(),
-            "bank": None,
-            "result": None,
-            "xlsx_path": None,
-        }
-
-    background_tasks.add_task(process_job, job_id, file_path, password)
-    return {"job_id": job_id}
-
-
-@app.get("/api/v1/jobs/{job_id}")
-def get_job(job_id: str):
-    with jobs_lock:
-        job = jobs.get(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
-    return {
-        "id": job["id"],
-        "status": job["status"],
-        "progress": job["progress"],
-        "message": job["message"],
-        "filename": job["filename"],
-        "bank": job["bank"],
-        "validation_status": job["result"].validation_status if job["result"] else None,
-        "transaction_count": len(job["result"].transactions) if job["result"] else None,
-    }
-
-
-@app.get("/api/v1/jobs/{job_id}/result")
-def get_result(job_id: str):
-    with jobs_lock:
-        job = jobs.get(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
-    if job["status"] != "completed" or not job["result"]:
-        raise HTTPException(status_code=409, detail="Result not ready")
-    result = job["result"]
+def _serialize_result(result) -> Dict[str, Any]:
     return {
         "metadata": {
             "bank_code": result.metadata.bank_code,
@@ -165,27 +94,197 @@ def get_result(job_id: str):
     }
 
 
+def _create_job(job_id: str, filename: str):
+    payload = {
+        "id": job_id,
+        "status": "queued",
+        "progress": 0,
+        "message": "Queued",
+        "filename": filename,
+        "bank": None,
+        "validation_status": None,
+        "transaction_count": None,
+        "result_json": None,
+        "xlsx_path": None,
+        "created_at": datetime.utcnow().isoformat(),
+        "completed_at": None,
+    }
+    if supabase:
+        supabase.table("jobs").insert(payload).execute()
+    else:
+        with jobs_lock:
+            jobs[job_id] = payload.copy()
+
+
+def _update_job(job_id: str, **kwargs):
+    if supabase:
+        supabase.table("jobs").update(kwargs).eq("id", job_id).execute()
+    else:
+        with jobs_lock:
+            if job_id in jobs:
+                jobs[job_id].update(kwargs)
+
+
+def _get_job(job_id: str) -> Optional[dict]:
+    if supabase:
+        res = supabase.table("jobs").select("*").eq("id", job_id).execute()
+        if res.data:
+            return res.data[0]
+        return None
+    with jobs_lock:
+        return jobs.get(job_id)
+
+
+def _delete_job(job_id: str) -> bool:
+    job = _get_job(job_id)
+    if not job:
+        return False
+    if supabase:
+        supabase.table("jobs").delete().eq("id", job_id).execute()
+        try:
+            supabase.storage.from_(SUPABASE_BUCKET).remove([f"{job_id}/input.pdf", f"{job_id}/output.xlsx"])
+        except Exception:
+            pass
+    else:
+        with jobs_lock:
+            jobs.pop(job_id, None)
+        job_dir = STORAGE_DIR / job_id
+        if job_dir.exists():
+            shutil.rmtree(job_dir, ignore_errors=True)
+    return True
+
+
+def _upload_storage(job_id: str, local_path: Path, remote_name: str) -> Optional[str]:
+    if not supabase:
+        return str(local_path)
+    remote_path = f"{job_id}/{remote_name}"
+    with local_path.open("rb") as f:
+        supabase.storage.from_(SUPABASE_BUCKET).upload(
+            remote_path,
+            f,
+            file_options={"content-type": "application/octet-stream", "upsert": "true"},
+        )
+    return remote_path
+
+
+def _signed_url(path: str) -> str:
+    if not supabase:
+        return path
+    res = supabase.storage.from_(SUPABASE_BUCKET).create_signed_url(path, 3600)
+    return res.get("signedURL") or res.get("signedUrl") or path
+
+
+def process_job(job_id: str, file_path: Path, password: Optional[str]):
+    try:
+        _update_job(job_id, status="processing", progress=10, message="Detecting bank")
+        bank = detect_bank(str(file_path), password=password)
+        _update_job(job_id, progress=25, message=f"Parsing {bank}")
+        result = PARSERS[bank](str(file_path), password=password)
+        _update_job(job_id, progress=60, message="Validating")
+        result = validate_parse_result(result)
+        xlsx_local = file_path.with_suffix(".xlsx")
+        _update_job(job_id, progress=80, message="Exporting Excel")
+        export_to_excel(result, str(xlsx_local))
+
+        result_json = _serialize_result(result)
+        if supabase:
+            input_remote = _upload_storage(job_id, file_path, "input.pdf")
+            xlsx_remote = _upload_storage(job_id, xlsx_local, "output.xlsx")
+            _update_job(
+                job_id,
+                status="completed",
+                progress=100,
+                message="Completed",
+                bank=bank,
+                validation_status=result.validation_status,
+                transaction_count=len(result.transactions),
+                result_json=result_json,
+                xlsx_path=xlsx_remote,
+                completed_at=datetime.utcnow().isoformat(),
+            )
+        else:
+            _update_job(
+                job_id,
+                status="completed",
+                progress=100,
+                message="Completed",
+                bank=bank,
+                validation_status=result.validation_status,
+                transaction_count=len(result.transactions),
+                result_json=result_json,
+                xlsx_path=str(xlsx_local),
+                completed_at=datetime.utcnow().isoformat(),
+            )
+    except Exception as exc:
+        _update_job(job_id, status="failed", progress=100, message=str(exc))
+
+
+@app.post("/api/v1/jobs")
+async def create_job(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    password: Optional[str] = Form(None),
+):
+    job_id = str(uuid.uuid4())
+    job_dir = STORAGE_DIR / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+    file_path = job_dir / (file.filename or "upload.pdf")
+    with file_path.open("wb") as f:
+        shutil.copyfileobj(file.file, f)
+
+    _create_job(job_id, file.filename or "upload.pdf")
+    background_tasks.add_task(process_job, job_id, file_path, password)
+    return {"job_id": job_id}
+
+
+@app.get("/api/v1/jobs/{job_id}")
+def get_job(job_id: str):
+    job = _get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return {
+        "id": job["id"],
+        "status": job["status"],
+        "progress": job["progress"],
+        "message": job["message"],
+        "filename": job["filename"],
+        "bank": job["bank"],
+        "validation_status": job["validation_status"],
+        "transaction_count": job["transaction_count"],
+    }
+
+
+@app.get("/api/v1/jobs/{job_id}/result")
+def get_result(job_id: str):
+    job = _get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job["status"] != "completed" or not job.get("result_json"):
+        raise HTTPException(status_code=409, detail="Result not ready")
+    return job["result_json"]
+
+
 @app.get("/api/v1/jobs/{job_id}/download")
 def download(job_id: str):
-    with jobs_lock:
-        job = jobs.get(job_id)
+    job = _get_job(job_id)
     if not job or not job.get("xlsx_path"):
         raise HTTPException(status_code=404, detail="File not found")
-    return FileResponse(job["xlsx_path"], filename=f"{job['bank']}_{job_id}.xlsx")
+    if supabase:
+        url = _signed_url(job["xlsx_path"])
+        return RedirectResponse(url)
+    from fastapi.responses import FileResponse
+
+    return FileResponse(job["xlsx_path"], filename=f"{job.get('bank') or 'mutation'}_{job_id}.xlsx")
 
 
 @app.delete("/api/v1/jobs/{job_id}")
 def delete_job(job_id: str):
-    with jobs_lock:
-        job = jobs.pop(job_id, None)
-    if not job:
+    ok = _delete_job(job_id)
+    if not ok:
         raise HTTPException(status_code=404, detail="Job not found")
-    job_dir = STORAGE_DIR / job_id
-    if job_dir.exists():
-        shutil.rmtree(job_dir, ignore_errors=True)
     return {"deleted": True}
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", "supabase": bool(supabase)}
