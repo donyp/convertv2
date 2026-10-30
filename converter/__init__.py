@@ -1,0 +1,1 @@
+"""Bank statement PDF to structured data converter."""
