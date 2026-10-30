@@ -54,12 +54,12 @@ export default function Home() {
       if (password) form.append("password", password);
       const res = await fetch(`${API_URL}/api/v1/jobs`, { method: "POST", body: form });
       if (!res.ok) {
+        const text = await res.text();
         let message = `Request gagal (${res.status})`;
         try {
-          const data = await res.json();
+          const data = JSON.parse(text);
           message = data.detail || data.message || message;
         } catch {
-          const text = await res.text();
           if (text && text.length < 200) message = text;
         }
         throw new Error(message);
@@ -76,13 +76,15 @@ export default function Home() {
     const interval = setInterval(async () => {
       try {
         const res = await fetch(`${API_URL}/api/v1/jobs/${jobId}`);
-        const data = await res.json();
+        const text = await res.text();
+        const data = JSON.parse(text);
         setJob(data);
         if (data.status === "completed") {
           clearInterval(interval);
           setUploading(false);
           const r = await fetch(`${API_URL}/api/v1/jobs/${jobId}/result`);
-          setResult(await r.json());
+          const resultText = await r.text();
+          setResult(JSON.parse(resultText));
         } else if (data.status === "failed") {
           clearInterval(interval);
           setUploading(false);
