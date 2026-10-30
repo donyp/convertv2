@@ -28,6 +28,8 @@ app = FastAPI()
 
 
 @app.post("/")
+@app.post("/api/convert")
+@app.post("/api/v1/convert")
 async def convert(file: UploadFile = File(...), password: str = Form(None)):
     base = Path("/tmp") if os.path.exists("/tmp") else Path(".")
     job_dir = base / str(uuid.uuid4())

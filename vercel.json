@@ -1,7 +1,17 @@
 {
+  "installCommand": "npm install",
+  "buildCommand": "next build",
+  "framework": "nextjs",
+  "rewrites": [
+    {
+      "source": "/api/v1/convert",
+      "destination": "/api/convert"
+    }
+  ],
   "functions": {
-    "api/convert.py": {
-      "maxDuration": 300
+    "api/*.py": {
+      "maxDuration": 300,
+      "excludeFiles": "{tests/**,.next/**,node_modules/**}"
     }
   }
 }
