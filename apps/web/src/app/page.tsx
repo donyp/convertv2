@@ -53,7 +53,17 @@ export default function Home() {
       form.append("file", file);
       if (password) form.append("password", password);
       const res = await fetch(`${API_URL}/api/v1/jobs`, { method: "POST", body: form });
-      if (!res.ok) throw new Error(await res.text());
+      if (!res.ok) {
+        let message = `Request gagal (${res.status})`;
+        try {
+          const data = await res.json();
+          message = data.detail || data.message || message;
+        } catch {
+          const text = await res.text();
+          if (text && text.length < 200) message = text;
+        }
+        throw new Error(message);
+      }
       const data = await res.json();
       pollJob(data.job_id);
     } catch (err: any) {
@@ -99,7 +109,7 @@ export default function Home() {
   }
 
   return (
-    <main className="min-h-screen bg-zinc-950 text-zinc-100">
+    <main className="min-h-screen overflow-x-hidden bg-zinc-950 text-zinc-100">
       <div className="mx-auto max-w-6xl px-4 py-12">
         <header className="mb-8">
           <h1 className="text-3xl font-semibold tracking-tight">Bank Mutation Converter</h1>
@@ -168,8 +178,8 @@ export default function Home() {
             </button>
 
             {error && (
-              <div className="mt-4 rounded-lg border border-red-900 bg-red-950/60 p-3 text-sm text-red-200">
-                {error}
+              <div className="mt-4 max-w-full overflow-hidden rounded-lg border border-red-900 bg-red-950/60 p-3 text-sm text-red-200">
+                <div className="break-words whitespace-pre-wrap">{error}</div>
               </div>
             )}
           </div>
