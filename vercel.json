@@ -2,6 +2,7 @@
   "installCommand": "npm install",
   "buildCommand": "next build",
   "framework": "nextjs",
+  "outputDirectory": ".next",
   "rewrites": [
     {
       "source": "/api/v1/convert",
